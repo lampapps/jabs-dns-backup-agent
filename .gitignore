@@ -1,0 +1,26 @@
+# Local config — Never committed; dns_backup.conf.example is the committed template.
+dns_backup.conf
+
+# Runtime state
+logs/*
+!logs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables (not currently used by this agent, but reserved)
+.env
+.env.local
+.env.*.local
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.AppleDouble
+.LSOverride
