@@ -32,7 +32,7 @@
 set -uo pipefail
 
 # Reported to the JABS dashboard as this agent's version. 
-readonly SCRIPT_VERSION="0.1.3"
+readonly SCRIPT_VERSION="0.1.4"
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION — defaults; override in /etc/sd_image_backup.conf or environment
@@ -262,12 +262,24 @@ generate_uuid() {
 # jabs_event [--flag value]...
 # Thin wrapper around jabs_client.py's `event` subcommand. Fire-and-forget:
 # no-op when JABS is disabled; sent even during --dry-run so the dashboard
-# API can be exercised without a real imaging run. Any failure (bad response,
+# API can be exercised without a real imaging run (the --message is tagged
+# "[DRY RUN]" so it's obvious on the dashboard). Any failure (bad response,
 # network error, missing python3) is logged as a warning and never aborts the
 # calling backup. Extra args are passed straight through to jabs_client.py —
 # see its --help for the full list of event fields.
 jabs_event() {
     jabs_enabled || return 0
+
+    local args=("$@")
+    if "$DRY_RUN"; then
+        local i
+        for i in "${!args[@]}"; do
+            if [[ "${args[$i]}" == "--message" ]]; then
+                args[i + 1]="[DRY RUN] ${args[$(( i + 1 ))]}"
+                break
+            fi
+        done
+    fi
 
     local output
     if ! output="$(python3 "${JABS_CLIENT}" event \
@@ -276,7 +288,7 @@ jabs_event() {
             --version "${JABS_AGENT_VERSION}" \
             --agent-type "DNS Backup" \
             --timeout "${JABS_TIMEOUT}" \
-            "$@" 2>&1)"; then
+            "${args[@]}" 2>&1)"; then
         log_warn "JABS event failed to send: ${output}"
         return 0
     fi
