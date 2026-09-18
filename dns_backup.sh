@@ -31,6 +31,9 @@
 
 set -uo pipefail
 
+# Reported to the JABS dashboard as this agent's version. 
+readonly SCRIPT_VERSION="0.1.3"
+
 # -----------------------------------------------------------------------------
 # CONFIGURATION — defaults; override in /etc/sd_image_backup.conf or environment
 # -----------------------------------------------------------------------------
@@ -77,7 +80,7 @@ fi
 JABS_CLIENT="${SCRIPT_DIR}/jabs_client.py"
 : "${JABS_SERVER_URL:=}"
 : "${JABS_AGENT_KEY:=}"
-: "${JABS_AGENT_VERSION:=0.1.0}"
+JABS_AGENT_VERSION="${SCRIPT_VERSION}"
 : "${JABS_TIMEOUT:=10}"
 
 # Seconds between progress heartbeats sent while a node's dd/gzip pipeline
@@ -405,16 +408,14 @@ image_node() {
         return 1
     fi
 
-    if ! "$DRY_RUN"; then
-        local bytes_backed_up
-        bytes_backed_up="$(stat -c%s "$outfile" 2>/dev/null || echo 0)"
-        jabs_event --event-type "backup_complete" --status "success" \
-            --message "SD image complete" --stage "Completed" \
-            --run-id "${run_id}" --job-name "${host}" --backup-set-id "${backup_set_id}" \
-            --backup-set-name "${backup_set_name}" --backup-type "full" \
-            --duration-seconds "${duration}" \
-            --files-backed-up 1 --bytes-backed-up "${bytes_backed_up}"
-    fi
+    local bytes_backed_up=0
+    "$DRY_RUN" || bytes_backed_up="$(stat -c%s "$outfile" 2>/dev/null || echo 0)"
+    jabs_event --event-type "backup_complete" --status "success" \
+        --message "SD image complete" --stage "Completed" \
+        --run-id "${run_id}" --job-name "${host}" --backup-set-id "${backup_set_id}" \
+        --backup-set-name "${backup_set_name}" --backup-type "full" \
+        --duration-seconds "${duration}" \
+        --files-backed-up 1 --bytes-backed-up "${bytes_backed_up}"
     CURRENT_RUN_ID=""
 
     log_info "Waiting ${REJOIN_WAIT}s for ${host} to fully rejoin before imaging peer ..."

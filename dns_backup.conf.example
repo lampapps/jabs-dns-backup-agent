@@ -7,9 +7,6 @@
 #   sudo chown root:root /etc/dns_backup.conf
 # =============================================================================
 
-# Reported on the host record; bump when you change this script.
-JABS_AGENT_VERSION="0.1.0"
-
 # Hostnames or IPs of your two DNS nodes
 DNS1_HOST="10.10.1.2"
 DNS2_HOST="10.10.1.3"

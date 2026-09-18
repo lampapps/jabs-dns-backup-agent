@@ -102,8 +102,11 @@ EOF
 | `IMAGE_RETENTION_DAYS` | `90` | Days to keep old `.img.gz` files (0 = keep forever) |
 | `JABS_SERVER_URL` | (unset) | JABS dashboard base URL, e.g. `http://jabs-server:5001`. Set to enable reporting; leave unset/empty to disable. |
 | `JABS_AGENT_KEY` | (unset) | API key for this agent, generated when you register it on the dashboard's Agents page. |
-| `JABS_AGENT_VERSION` | `0.1.0` | Reported on the agent record; bump when you change this script. |
 | `JABS_TIMEOUT` | `10` | Per-request timeout (seconds) for calls to the JABS dashboard. |
+
+The version reported to the dashboard is not a config option — it's the
+`SCRIPT_VERSION` constant at the top of `dns_backup.sh`, bumped in git each
+time the script changes.
 
 ---
 
