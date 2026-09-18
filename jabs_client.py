@@ -24,8 +24,8 @@ X-API-Key header. Register the agent on the dashboard's Agents page to
 obtain a key.
 
 Usage:
-    jabs_client.py event --server-url URL --agent-key KEY --hostname H \\
-        --ip-address IP [--version V] [--agent-type T] [--event-type E] \\
+    jabs_client.py event --server-url URL --agent-key KEY \
+        [--version V] [--agent-type T] [--event-type E] \
         [--message M] [--stage S] [--run-id R] [--backup-set-id ID] \\
         [--backup-set-name N] [--job-name J] [--backup-type T] \\
         [--source S] [--destination D] [--encrypt true|false] \\
@@ -82,10 +82,7 @@ def _report(status, body):
 
 
 def cmd_event(args):
-    payload = {
-        "hostname": args.hostname,
-        "ip_address": args.ip_address,
-    }
+    payload = {}
 
     optional_str = {
         "version": args.version,
@@ -139,8 +136,6 @@ def build_parser():
     common.add_argument("--server-url", required=True, help="e.g. http://jabs-server:5001")
     common.add_argument("--agent-key", default=os.environ.get("JABS_AGENT_KEY"),
                          help="API key for this agent (default: JABS_AGENT_KEY env var)")
-    common.add_argument("--hostname", required=True)
-    common.add_argument("--ip-address", required=True)
     common.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
 
     ev = sub.add_parser("event", parents=[common], help="POST /api/monitoring/events")

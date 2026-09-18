@@ -1,21 +1,50 @@
 # =============================================================================
-# sd_image_backup.conf — Configuration for sd_image_backup.sh
+# dns_backup.conf — Configuration for dns_backup.sh
 #
-# Copy to /etc/sd_image_backup.conf on your WORKSTATION and set permissions:
-#   sudo cp sd_image_backup.conf.example /etc/sd_image_backup.conf
-#   sudo chmod 600 /etc/sd_image_backup.conf
-#   sudo chown root:root /etc/sd_image_backup.conf
+# Copy to /etc/dns_backup.conf on your WORKSTATION and set permissions:
+#   sudo cp dns_backup.conf.example /etc/dns_backup.conf
+#   sudo chmod 600 /etc/dns_backup.conf
+#   sudo chown root:root /etc/dns_backup.conf
 # =============================================================================
 
 # Reported on the host record; bump when you change this script.
 JABS_AGENT_VERSION="0.1.0"
 
 # Hostnames or IPs of your two DNS nodes
-DNS1_HOST="dns1"
-DNS2_HOST="dns2"
+DNS1_HOST="10.10.1.2"
+DNS2_HOST="10.10.1.3"
+
+# ── JABS agent monitoring (optional) ──────────────────────────────────────
+# Reports each node's imaging run as a job to a JABS dashboard, via
+# jabs_client.py (a small stdlib-only Python HTTP client — requires
+# python3, no pip install needed). Set JABS_SERVER_URL="" (or leave unset)
+# to disable — everything below is then ignored.
+#
+# IMPORTANT: register this agent on the JABS dashboard's Agents page first —
+# there is no self-registration API. Registering returns a unique API key;
+# paste it into JABS_AGENT_KEY below.
+JABS_SERVER_URL="http://10.10.2.10:5000"
+
+# API key for this agent, generated when you register it on the dashboard.
+JABS_AGENT_KEY=""
+
+# NAS mount point (must be mounted and writable on your workstation)
+NAS_MOUNT="/mnt/nas-unas"
+
+# Base directory for image files
+# Images are written to: BACKUP_BASE_DIR/<node>/sd_image_<timestamp>.img.gz
+BACKUP_BASE_DIR="/mnt/nas-unas/backups"
+
+#── Uncomment below to override defaults as needed. ──────────────────────────────────────
+
+# Days to retain old image files (0 = keep forever)
+#IMAGE_RETENTION_DAYS=90
+
+# Per-request timeout (seconds) for calls to the JABS dashboard.
+#JABS_TIMEOUT=10
 
 # SSH user on the RPi nodes
-SSH_USER="pi"
+#SSH_USER="pi"
 
 # Block device for the built-in SD card slot on RPi4 (rarely needs changing)
 #SD_DEVICE="/dev/mmcblk0"
@@ -32,35 +61,4 @@ SSH_USER="pi"
 # Seconds to wait after restarting a node before imaging the peer.
 # Allows keepalived to reclaim the VIP and the node to fully rejoin.
 #REJOIN_WAIT=30
-
-# NAS mount point (must be mounted and writable on your workstation)
-#NAS_MOUNT="/mnt/nas-unas"
-
-# Base directory for image files
-# Images are written to: BACKUP_BASE_DIR/<node>/sd_image_<timestamp>.img.gz
-#BACKUP_BASE_DIR="/mnt/nas-unas/backups"
-
-# Days to retain old image files (0 = keep forever)
-#IMAGE_RETENTION_DAYS=90
-
-# ── JABS agent monitoring (optional) ──────────────────────────────────────
-# Reports each node's imaging run as a job to a JABS dashboard, via
-# jabs_client.py (a small stdlib-only Python HTTP client — requires
-# python3, no pip install needed). Set JABS_SERVER_URL="" (or leave unset)
-# to disable — everything below is then ignored.
-#
-# IMPORTANT: register this agent on the JABS dashboard's Agents page first —
-# there is no self-registration API. Registering returns a unique API key;
-# paste it into JABS_AGENT_KEY below.
-#JABS_SERVER_URL="http://jabs-server:5001"
-
-# API key for this agent, generated when you register it on the dashboard.
-#JABS_AGENT_KEY=""
-
-# Informational only (shown on the Agents page; not used for authentication).
-#JABS_HOSTNAME="$(hostname)"
-#JABS_IP_ADDRESS="192.168.1.50"
-
-# Per-request timeout (seconds) for calls to the JABS dashboard.
-#JABS_TIMEOUT=10
 

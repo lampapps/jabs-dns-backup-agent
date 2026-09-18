@@ -77,10 +77,12 @@ fi
 JABS_CLIENT="${SCRIPT_DIR}/jabs_client.py"
 : "${JABS_SERVER_URL:=}"
 : "${JABS_AGENT_KEY:=}"
-: "${JABS_HOSTNAME:=$(hostname)}"
-: "${JABS_IP_ADDRESS:=}"
 : "${JABS_AGENT_VERSION:=0.1.0}"
 : "${JABS_TIMEOUT:=10}"
+
+# Seconds between progress heartbeats sent while a node's dd/gzip pipeline
+# is running (it can take a long time with no other natural checkpoint).
+: "${JABS_PROGRESS_INTERVAL:=300}"
 
 # -----------------------------------------------------------------------------
 # Derived runtime values (computed after config is sourced)
@@ -105,6 +107,10 @@ CURRENT_JOB_NAME=""
 CURRENT_BACKUP_SET_ID=""
 CURRENT_BACKUP_SET_NAME=""
 CURRENT_JOB_START_EPOCH=0
+
+# PID of the background periodic-progress-heartbeat loop (see
+# _start_progress_heartbeat/_stop_progress_heartbeat), if one is running.
+JABS_PROGRESS_PID=""
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -205,6 +211,8 @@ _cleanup() {
         start_services "$_TRAP_NODE"
     fi
 
+    _stop_progress_heartbeat
+
     if [[ -n "${CURRENT_RUN_ID:-}" ]]; then
         local duration=$(( $(date +%s) - ${CURRENT_JOB_START_EPOCH:-$(date +%s)} ))
         jabs_event --event-type "backup_complete" --status "stopped" --stage "Stopped" \
@@ -265,8 +273,6 @@ jabs_event() {
     if ! output="$(python3 "${JABS_CLIENT}" event \
             --server-url "${JABS_SERVER_URL}" \
             --agent-key "${JABS_AGENT_KEY}" \
-            --hostname "${JABS_HOSTNAME}" \
-            --ip-address "${JABS_IP_ADDRESS}" \
             --version "${JABS_AGENT_VERSION}" \
             --agent-type "DNS Backup" \
             --timeout "${JABS_TIMEOUT}" \
@@ -275,6 +281,39 @@ jabs_event() {
         return 0
     fi
     return 0
+}
+
+# _start_progress_heartbeat run_id job_name backup_set_id backup_set_name start_epoch
+# Launches a background loop sending a heartbeat every JABS_PROGRESS_INTERVAL
+# seconds while a long dd/gzip pipeline runs, so the dashboard shows the job
+# as alive rather than going quiet between the start and completion events.
+_start_progress_heartbeat() {
+    local run_id="$1" job_name="$2" backup_set_id="$3" backup_set_name="$4" start_epoch="$5"
+    jabs_enabled || return 0
+    "$DRY_RUN" && return 0
+
+    (
+        while sleep "${JABS_PROGRESS_INTERVAL}"; do
+            local elapsed=$(( $(date +%s) - start_epoch ))
+            jabs_event --event-type "heartbeat" --stage "Imaging in progress" \
+                --message "${job_name}: still imaging (${elapsed}s elapsed)" \
+                --run-id "${run_id}" --job-name "${job_name}" \
+                --backup-set-id "${backup_set_id}" --backup-set-name "${backup_set_name}" \
+                --backup-type "full"
+        done
+    ) &
+    JABS_PROGRESS_PID=$!
+    disown "${JABS_PROGRESS_PID}" 2>/dev/null || true
+}
+
+# Stops the background loop started by _start_progress_heartbeat, if any.
+# Safe to call even if none is running (e.g. JABS disabled or --dry-run).
+_stop_progress_heartbeat() {
+    if [[ -n "${JABS_PROGRESS_PID}" ]]; then
+        kill "${JABS_PROGRESS_PID}" 2>/dev/null || true
+        wait "${JABS_PROGRESS_PID}" 2>/dev/null || true
+        JABS_PROGRESS_PID=""
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -334,6 +373,8 @@ image_node() {
     local image_start_epoch
     image_start_epoch="$(date +%s)"
 
+    _start_progress_heartbeat "${run_id}" "${host}" "${backup_set_id}" "${backup_set_name}" "${image_start_epoch}"
+
     if "$DRY_RUN"; then
         log_info "[DRY RUN] Would run: ssh ${SSH_USER}@${host} 'sudo dd if=${SD_DEVICE} bs=4M 2>/dev/null' | gzip > ${outfile}"
     else
@@ -350,6 +391,8 @@ image_node() {
             imaging_failed=true
         fi
     fi
+
+    _stop_progress_heartbeat
 
     start_services "$host"
 
@@ -522,6 +565,8 @@ main() {
         (( ERRORS++ )) || true
     fi
 
+    jabs_event --message "${DNS1_HOST} finished — starting ${DNS2_HOST}"
+
     if image_node "$DNS2_HOST"; then
         log_info "Node ${DNS2_HOST}: image complete"
     else
@@ -530,6 +575,8 @@ main() {
     fi
 
     cleanup_old_images
+
+    jabs_event --message "sd_image_backup run finished (${ERRORS} failure(s))"
 
     log_info "========================================================"
     if (( ERRORS == 0 )); then

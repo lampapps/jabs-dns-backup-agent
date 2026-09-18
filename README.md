@@ -102,8 +102,6 @@ EOF
 | `IMAGE_RETENTION_DAYS` | `90` | Days to keep old `.img.gz` files (0 = keep forever) |
 | `JABS_SERVER_URL` | (unset) | JABS dashboard base URL, e.g. `http://jabs-server:5001`. Set to enable reporting; leave unset/empty to disable. |
 | `JABS_AGENT_KEY` | (unset) | API key for this agent, generated when you register it on the dashboard's Agents page. |
-| `JABS_HOSTNAME` | `$(hostname)` | Informational only (shown on the Agents page; not used for authentication). |
-| `JABS_IP_ADDRESS` | (unset) | Informational only. |
 | `JABS_AGENT_VERSION` | `0.1.0` | Reported on the agent record; bump when you change this script. |
 | `JABS_TIMEOUT` | `10` | Per-request timeout (seconds) for calls to the JABS dashboard. |
 
@@ -120,16 +118,15 @@ Enable it in `dns_backup.conf`:
 ```bash
 JABS_SERVER_URL="http://jabs-server:5001"
 JABS_AGENT_KEY=""                # paste the key from the dashboard here
-JABS_HOSTNAME="$(hostname)"      # informational only, shown on the Agents page
-JABS_IP_ADDRESS="192.168.1.50"   # informational only
 JABS_TIMEOUT=10
 ```
 
 Before the first run, you must register this agent on the JABS dashboard's
-Agents page. Registering generates a unique API key; paste it into
-`JABS_AGENT_KEY`. Every request is authenticated by that key alone (sent as
-the `X-API-Key` header) — `JABS_HOSTNAME`/`JABS_IP_ADDRESS` are stored for
-display only and don't need to match anything.
+Agents page — that's also where you set this agent's hostname/IP for
+display (the dashboard ignores any hostname/IP an agent reports; it isn't
+used for auth or stored from event payloads). Registering generates a
+unique API key; paste it into `JABS_AGENT_KEY`. Every request is
+authenticated by that key alone (sent as the `X-API-Key` header).
 
 **How nodes map to JABS jobs:** each node (`DNS1_HOST`/`DNS2_HOST`) is
 reported under its hostname as the job name. Unlike an ongoing mirror sync,
