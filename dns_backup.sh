@@ -258,16 +258,13 @@ generate_uuid() {
 
 # jabs_event [--flag value]...
 # Thin wrapper around jabs_client.py's `event` subcommand. Fire-and-forget:
-# no-ops when JABS is disabled or during --dry-run, and any failure (bad
-# response, network error, missing python3) is logged as a warning and never
-# aborts the calling backup. Extra args are passed straight through to
-# jabs_client.py — see its --help for the full list of event fields.
+# no-op when JABS is disabled; sent even during --dry-run so the dashboard
+# API can be exercised without a real imaging run. Any failure (bad response,
+# network error, missing python3) is logged as a warning and never aborts the
+# calling backup. Extra args are passed straight through to jabs_client.py —
+# see its --help for the full list of event fields.
 jabs_event() {
     jabs_enabled || return 0
-    if "$DRY_RUN"; then
-        log_info "[DRY RUN] JABS event (not sent): $*"
-        return 0
-    fi
 
     local output
     if ! output="$(python3 "${JABS_CLIENT}" event \
@@ -290,7 +287,6 @@ jabs_event() {
 _start_progress_heartbeat() {
     local run_id="$1" job_name="$2" backup_set_id="$3" backup_set_name="$4" start_epoch="$5"
     jabs_enabled || return 0
-    "$DRY_RUN" && return 0
 
     (
         while sleep "${JABS_PROGRESS_INTERVAL}"; do
