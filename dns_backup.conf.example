@@ -1,10 +1,10 @@
 # =============================================================================
 # dns_backup.conf — Configuration for dns_backup.sh
 #
-# Copy to /etc/dns_backup.conf on your WORKSTATION and set permissions:
-#   sudo cp dns_backup.conf.example /etc/dns_backup.conf
-#   sudo chmod 600 /etc/dns_backup.conf
-#   sudo chown root:root /etc/dns_backup.conf
+# Must live in the same directory as dns_backup.sh (the script only sources
+# a config file next to itself):
+#   cp dns_backup.conf.example dns_backup.conf
+#   chmod 600 dns_backup.conf
 # =============================================================================
 
 # Hostnames or IPs of your two DNS nodes
@@ -14,16 +14,28 @@ DNS2_HOST="10.10.1.3"
 # ── JABS agent monitoring (optional) ──────────────────────────────────────
 # Reports each node's imaging run as a job to a JABS dashboard, via
 # jabs_client.py (a small stdlib-only Python HTTP client — requires
-# python3, no pip install needed). Set JABS_SERVER_URL="" (or leave unset)
-# to disable — everything below is then ignored.
+# python3, no pip install needed). Set JABS_DASHBOARD_URL="" (or leave unset)
+# to disable — everything below is then ignored. (JABS_SERVER_URL is still
+# accepted as a deprecated alias.)
 #
 # IMPORTANT: register this agent on the JABS dashboard's Agents page first —
 # there is no self-registration API. Registering returns a unique API key;
 # paste it into JABS_AGENT_KEY below.
-JABS_SERVER_URL="http://10.10.2.10:5000"
+JABS_DASHBOARD_URL="http://<server-ip>:5001"  #:5000 for production,:5001 for development as set in your dashboard .env file
 
 # API key for this agent, generated when you register it on the dashboard.
 JABS_AGENT_KEY=""
+
+# Name shown in the dashboard's Job Name column. One job name covers the
+# entire run of this script (both DNS nodes) — it is not per-node; each
+# node still shows its own host as its target.
+JOB_NAME="DNS Backup"
+
+# Optional: cron expression matching this script's entry in the host's
+# crontab (e.g. "0 3 1 * *"). Purely advisory — reported to the dashboard
+# to compute its "Next Event" column; this script still only runs whenever
+# cron actually invokes it, regardless of this value.
+#JOB_CRON="0 3 1 * *"
 
 # NAS mount point (must be mounted and writable on your workstation)
 NAS_MOUNT="/mnt/nas-unas"

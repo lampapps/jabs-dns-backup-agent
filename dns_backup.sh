@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# sd_image_backup.sh
+# dns_backup.sh
 # Creates a compressed full SD card image of each HA DNS node via SSH.
 #
 # For each node in turn:
@@ -14,28 +14,28 @@
 # authentication with passwordless sudo for 'dd' and 'systemctl' on each node.
 #
 # Usage:
-#   ./sd_image_backup.sh [--dry-run] [--help]
+#   ./dns_backup.sh [--dry-run] [--help]
 #
 # Config file (sourced if present, in the same directory as this script):
-#   sd_image_backup.conf
+#   dns_backup.conf
 #
-#   python3      — only required if JABS_SERVER_URL is set (see below).
+#   python3      — only required if JABS_DASHBOARD_URL is set (see below).
 #                  Used to run jabs_client.py, which reports imaging activity
 #                  to a JABS dashboard's Agent Monitoring API.
 #                  Debian/Ubuntu : sudo apt install python3
 #                  RHEL/Fedora   : sudo dnf install python3
 #
 # Cron example (monthly at 03:00, on your workstation):
-#   0 3 1 * * /usr/local/sbin/sd_image_backup.sh
+#   0 3 1 * * /usr/local/sbin/dns_backup.sh
 # =============================================================================
 
 set -uo pipefail
 
 # Reported to the JABS dashboard as this agent's version. 
-readonly SCRIPT_VERSION="0.1.4"
+readonly SCRIPT_VERSION="0.2.0" 
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION — defaults; override in /etc/sd_image_backup.conf or environment
+# CONFIGURATION — defaults; override in dns_backup.conf or environment
 # -----------------------------------------------------------------------------
 DNS1_HOST="${DNS1_HOST:-dns1}"        # hostname or IP of first node
 DNS2_HOST="${DNS2_HOST:-dns2}"        # hostname or IP of second node
@@ -78,10 +78,21 @@ fi
 # ── JABS agent monitoring — defaults, so a config from before this feature
 # existed still loads fine (JABS reporting simply stays disabled) ─────────
 JABS_CLIENT="${SCRIPT_DIR}/jabs_client.py"
-: "${JABS_SERVER_URL:=}"
+# JABS_DASHBOARD_URL is the current name; JABS_SERVER_URL still works as a
+# deprecated alias for configs written before the Dashboard rename.
+: "${JABS_DASHBOARD_URL:=${JABS_SERVER_URL:-}}"
 : "${JABS_AGENT_KEY:=}"
 JABS_AGENT_VERSION="${SCRIPT_VERSION}"
 : "${JABS_TIMEOUT:=10}"
+
+# Single job name covering the entire run (both nodes); each node still
+# reports its own host as the job target (target_id/target_label).
+: "${JOB_NAME:=DNS Backup}"
+
+# Optional: cron expression matching this script's crontab entry, reported
+# to the dashboard for the "Next Event" column. Purely advisory — this
+# script still only runs whenever cron actually invokes it.
+: "${JOB_CRON:=}"
 
 # Seconds between progress heartbeats sent while a node's dd/gzip pipeline
 # is running (it can take a long time with no other natural checkpoint).
@@ -91,7 +102,12 @@ JABS_AGENT_VERSION="${SCRIPT_VERSION}"
 # Derived runtime values (computed after config is sourced)
 # -----------------------------------------------------------------------------
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-readonly LOG_FILE="${BACKUP_BASE_DIR}/sd_image_backup_${TIMESTAMP}.log"
+
+# Logs live locally next to the script (same style as the other JABS agents),
+# not on the NAS alongside the images. Old logs are pruned in
+# cleanup_old_images(), alongside their associated image files.
+readonly LOG_DIR="${SCRIPT_DIR}/logs"
+readonly LOG_FILE="${LOG_DIR}/sd_image_backup_${TIMESTAMP}.log"
 
 DRY_RUN=false
 ERRORS=0
@@ -107,9 +123,14 @@ _TRAP_SERVICES_STOPPED=false
 # mid-image — otherwise it would stay stuck at status='running' forever.
 CURRENT_RUN_ID=""
 CURRENT_JOB_NAME=""
-CURRENT_BACKUP_SET_ID=""
-CURRENT_BACKUP_SET_NAME=""
+CURRENT_TARGET_ID=""
+CURRENT_TARGET_LABEL=""
 CURRENT_JOB_START_EPOCH=0
+
+# Shared by both DNS1/DNS2 nodes in one script invocation (set once in
+# main()) so the dashboard can group them into a single "job run" via
+# --job-run-id.
+JOB_RUN_ID=""
 
 # PID of the background periodic-progress-heartbeat loop (see
 # _start_progress_heartbeat/_stop_progress_heartbeat), if one is running.
@@ -221,8 +242,8 @@ _cleanup() {
         jabs_event --event-type "backup_complete" --status "stopped" --stage "Stopped" \
             --message "${CURRENT_JOB_NAME} imaging interrupted by script termination (resumes next run)" \
             --run-id "${CURRENT_RUN_ID}" --job-name "${CURRENT_JOB_NAME}" \
-            --backup-set-id "${CURRENT_BACKUP_SET_ID}" --backup-set-name "${CURRENT_BACKUP_SET_NAME}" \
-            --backup-type "full" --duration-seconds "${duration}" \
+            --target-id "${CURRENT_TARGET_ID}" --target-label "${CURRENT_TARGET_LABEL}" \
+            --backup-type "Image" --duration-seconds "${duration}" \
             --files-backed-up 0 --bytes-backed-up 0 \
             --error-message "${CURRENT_JOB_NAME} imaging interrupted by script termination (resumes next run)"
         CURRENT_RUN_ID=""
@@ -235,19 +256,22 @@ trap _cleanup EXIT INT TERM
 # -----------------------------------------------------------------------------
 # Reports each node's imaging run to a JABS dashboard's Agent Monitoring API
 # (see AGENTS_API_GUIDE.md in the jabs-dashboard repo). Disabled entirely
-# when JABS_SERVER_URL is empty.
+# when JABS_DASHBOARD_URL is empty.
 #
-# Each node's imaging run is its own dated backup set (job_name=host,
-# backup_set_id="<host>-<timestamp>"), unlike an ongoing mirror sync — every
-# run produces a brand-new image file, so it gets a brand-new set id.
+# JOB_NAME (configurable via dns_backup.conf) is shared across both nodes
+# for the whole run; each node's host (DNS1_HOST/DNS2_HOST) is reported as
+# that job's target_id/target_label instead — imaging runs aren't dated
+# sub-jobs of a target, so a timestamp in target_id/label would just create
+# a new, needless target per run in the dashboard's UI.
 #
-# The dashboard purges its own job records per its own agent-type-aware
-# retention policy (see the dashboard's README.md Retention Purge section)
-# — this script has no API to tell the dashboard when to purge records;
-# IMAGE_RETENTION_DAYS above only controls this script's own local image
-# files, independent of the dashboard's copy of the data.
+# The dashboard purges its own job records per its own retention policy
+# (see the dashboard's README.md Retention Purge section); IMAGE_RETENTION_DAYS
+# above only controls this script's own local image files, independent of
+# the dashboard's copy of the data. cleanup_old_images() below reports each
+# deleted image's filename to the dashboard via jabs_purge so the matching
+# run's status flips to "purged" without deleting the dashboard's record.
 
-jabs_enabled() { [[ -n "${JABS_SERVER_URL}" ]]; }
+jabs_enabled() { [[ -n "${JABS_DASHBOARD_URL}" ]]; }
 
 # generate_uuid  →  prints a UUID (for run_id). Only called when JABS is
 # enabled, so python3's availability has already been confirmed by then.
@@ -283,7 +307,7 @@ jabs_event() {
 
     local output
     if ! output="$(python3 "${JABS_CLIENT}" event \
-            --server-url "${JABS_SERVER_URL}" \
+            --server-url "${JABS_DASHBOARD_URL}" \
             --agent-key "${JABS_AGENT_KEY}" \
             --version "${JABS_AGENT_VERSION}" \
             --agent-type "DNS Backup" \
@@ -295,12 +319,32 @@ jabs_event() {
     return 0
 }
 
-# _start_progress_heartbeat run_id job_name backup_set_id backup_set_name start_epoch
+# jabs_purge --target-id ID --external-id ID1 [--external-id ID2 ...] [--message M]
+# Thin wrapper around jabs_client.py's `purge` subcommand. Fire-and-forget,
+# same semantics as jabs_event (no-op when JABS is disabled, failures logged
+# as warnings and never abort the caller). Call right after deleting local
+# artifact(s) previously reported via --external-id on a backup_complete event.
+jabs_purge() {
+    jabs_enabled || return 0
+
+    local output
+    if ! output="$(python3 "${JABS_CLIENT}" purge \
+            --server-url "${JABS_DASHBOARD_URL}" \
+            --agent-key "${JABS_AGENT_KEY}" \
+            --timeout "${JABS_TIMEOUT}" \
+            "$@" 2>&1)"; then
+        log_warn "JABS purge failed to send: ${output}"
+        return 0
+    fi
+    return 0
+}
+
+# _start_progress_heartbeat run_id job_name target_id target_label start_epoch
 # Launches a background loop sending a heartbeat every JABS_PROGRESS_INTERVAL
 # seconds while a long dd/gzip pipeline runs, so the dashboard shows the job
 # as alive rather than going quiet between the start and completion events.
 _start_progress_heartbeat() {
-    local run_id="$1" job_name="$2" backup_set_id="$3" backup_set_name="$4" start_epoch="$5"
+    local run_id="$1" job_name="$2" target_id="$3" target_label="$4" start_epoch="$5"
     jabs_enabled || return 0
 
     (
@@ -309,8 +353,8 @@ _start_progress_heartbeat() {
             jabs_event --event-type "heartbeat" --stage "Imaging in progress" \
                 --message "${job_name}: still imaging (${elapsed}s elapsed)" \
                 --run-id "${run_id}" --job-name "${job_name}" \
-                --backup-set-id "${backup_set_id}" --backup-set-name "${backup_set_name}" \
-                --backup-type "full"
+                --target-id "${target_id}" --target-label "${target_label}" \
+                --backup-type "Image"
         done
     ) &
     JABS_PROGRESS_PID=$!
@@ -327,11 +371,64 @@ _stop_progress_heartbeat() {
     fi
 }
 
+# parse_dd_progress_line LINE  →  prints "BYTES_DONE BYTES_PER_SEC" on a
+# match, or returns 1 on a non-matching line. Matches GNU dd's
+# `status=progress` periodic line, e.g.:
+#   "5292277248 bytes (5.3 GB, 4.9 GiB) copied, 5 s, 1.1 GB/s"
+# dd's rate unit is decimal/SI (kB=1000, not 1024), unlike rsync's.
+parse_dd_progress_line() {
+    local line="$1"
+    if [[ "${line}" =~ ^([0-9]+)\ bytes.*copied,\ [0-9.]+\ s,\ ([0-9.]+)\ ([A-Za-z]+)/s ]]; then
+        local bytes_done="${BASH_REMATCH[1]}"
+        local rate_value="${BASH_REMATCH[2]}"
+        local rate_unit="${BASH_REMATCH[3]}"
+        local mult=1
+        case "${rate_unit}" in
+            kB|KB) mult=1000 ;;
+            MB) mult=1000000 ;;
+            GB) mult=1000000000 ;;
+            TB) mult=1000000000000 ;;
+        esac
+        local bps
+        bps="$(echo "scale=0; (${rate_value}*${mult})/1" | bc)"
+        echo "${bytes_done} ${bps}"
+        return 0
+    fi
+    return 1
+}
+
+# watch_dd_progress RUN_ID JOB_NAME TARGET_ID  →  reads dd's status=progress
+# lines from stdin (after \r→\n translation), throttling both the local log
+# and the JABS progress POST to ~5s wall-clock (no percent/ETA available for
+# a raw block device copy, so there's no decile-based throttle here, unlike
+# the other agents). Best-effort: a parse miss on any line is just skipped.
+watch_dd_progress() {
+    local run_id="$1" job_name="$2" target_id="$3"
+    local last_post=0 line parsed bytes_done bps now
+    while IFS= read -r line; do
+        parsed="$(parse_dd_progress_line "${line}")" || continue
+        bytes_done="${parsed%% *}"
+        bps="${parsed##* }"
+        now="$(date +%s)"
+        if (( now - last_post >= 5 )); then
+            last_post=${now}
+            log_info "Imaging ${target_id}: ${bytes_done} bytes copied (${bps} B/s)"
+            jabs_event --event-type "heartbeat" --stage "Imaging in progress" \
+                --message "Imaging ${target_id} in progress" \
+                --run-id "${run_id}" --job-name "${job_name}" --target-id "${target_id}" \
+                --backup-type "Image" \
+                --bytes-backed-up "${bytes_done}" --bytes-per-second "${bps}"
+        fi
+    done
+}
+
 # -----------------------------------------------------------------------------
 # Image a single node
 # -----------------------------------------------------------------------------
 image_node() {
     local host="$1"
+    local node_name="$2"
+    local job_name="${JOB_NAME}"
     local outdir="${BACKUP_BASE_DIR}/${host}"
     local outfile="${outdir}/sd_image_${TIMESTAMP}.img.gz"
 
@@ -345,20 +442,23 @@ image_node() {
         mkdir -p "$outdir" || { log_error "Cannot create directory: ${outdir}"; return 1; }
     fi
 
-    # ── JABS: one run_id/backup_set per node per run (a new dated image) ──
+    # ── JABS: one run_id/job target per node per run (a new dated image) ──
+    # job_name (JOB_NAME) is shared across both nodes for the whole run; the
+    # target is node_name (DNS1/DNS2), stable even if DNS1_HOST/DNS2_HOST
+    # (the IP/hostname used for SSH) changes.
     local run_id=""
     jabs_enabled && run_id="$(generate_uuid)"
-    local backup_set_id="${host}-${TIMESTAMP}"
-    local backup_set_name="${host} ${TIMESTAMP}"
+    local target_id="${node_name}"
+    local target_label="${node_name}"
 
     # Track this job as "in flight" so the EXIT trap can finalize it as
     # "stopped" if the script is interrupted before we reach one of the
     # normal completion points below (cleared right before every return).
     if jabs_enabled; then
         CURRENT_RUN_ID="${run_id}"
-        CURRENT_JOB_NAME="${host}"
-        CURRENT_BACKUP_SET_ID="${backup_set_id}"
-        CURRENT_BACKUP_SET_NAME="${backup_set_name}"
+        CURRENT_JOB_NAME="${job_name}"
+        CURRENT_TARGET_ID="${target_id}"
+        CURRENT_TARGET_LABEL="${target_label}"
         CURRENT_JOB_START_EPOCH="$(date +%s)"
     fi
 
@@ -367,10 +467,11 @@ image_node() {
         --message "Starting SD image: ${host}" \
         --stage "Starting image" \
         --run-id "${run_id}" \
-        --job-name "${host}" \
-        --backup-type "full" \
-        --backup-set-id "${backup_set_id}" \
-        --backup-set-name "${backup_set_name}" \
+        --job-run-id "${JOB_RUN_ID}" \
+        --job-name "${job_name}" \
+        --backup-type "Image" \
+        --target-id "${target_id}" \
+        --target-label "${target_label}" \
         --source "${host}:${SD_DEVICE}" \
         --destination "${outfile}"
 
@@ -384,13 +485,26 @@ image_node() {
     local image_start_epoch
     image_start_epoch="$(date +%s)"
 
-    _start_progress_heartbeat "${run_id}" "${host}" "${backup_set_id}" "${backup_set_name}" "${image_start_epoch}"
+    _start_progress_heartbeat "${run_id}" "${host}" "${target_id}" "${target_label}" "${image_start_epoch}"
 
     if "$DRY_RUN"; then
         log_info "[DRY RUN] Would run: ssh ${SSH_USER}@${host} 'sudo dd if=${SD_DEVICE} bs=4M 2>/dev/null' | gzip > ${outfile}"
     else
         local tmp_file="${outfile}.tmp"
-        if _ssh "$host" "sudo dd if=${SD_DEVICE} bs=4M 2>/dev/null" | gzip > "$tmp_file"; then
+        local dd_ok=false
+        if jabs_enabled; then
+            if _ssh "$host" "sudo dd if=${SD_DEVICE} bs=4M status=progress" \
+                    2> >(stdbuf -oL tr '\r' '\n' | watch_dd_progress "${run_id}" "${job_name}" "${target_id}") \
+                    | gzip > "$tmp_file"; then
+                dd_ok=true
+            fi
+            wait
+        else
+            if _ssh "$host" "sudo dd if=${SD_DEVICE} bs=4M 2>/dev/null" | gzip > "$tmp_file"; then
+                dd_ok=true
+            fi
+        fi
+        if "$dd_ok"; then
             mv "$tmp_file" "$outfile"
             chmod 600 "$outfile"
             local size
@@ -412,8 +526,8 @@ image_node() {
     if "$imaging_failed"; then
         jabs_event --event-type "error" --status "failed" \
             --message "SD image failed: ${host}" --stage "Error" \
-            --run-id "${run_id}" --job-name "${host}" --backup-set-id "${backup_set_id}" \
-            --backup-set-name "${backup_set_name}" --backup-type "full" \
+            --run-id "${run_id}" --job-name "${job_name}" --target-id "${target_id}" \
+            --target-label "${target_label}" --backup-type "Image" \
             --duration-seconds "${duration}" \
             --error-message "dd/gzip pipeline failed for ${host}"
         CURRENT_RUN_ID=""
@@ -424,10 +538,11 @@ image_node() {
     "$DRY_RUN" || bytes_backed_up="$(stat -c%s "$outfile" 2>/dev/null || echo 0)"
     jabs_event --event-type "backup_complete" --status "success" \
         --message "SD image complete" --stage "Completed" \
-        --run-id "${run_id}" --job-name "${host}" --backup-set-id "${backup_set_id}" \
-        --backup-set-name "${backup_set_name}" --backup-type "full" \
+        --run-id "${run_id}" --job-name "${job_name}" --target-id "${target_id}" \
+        --target-label "${target_label}" --backup-type "Image" \
         --duration-seconds "${duration}" \
-        --files-backed-up 1 --bytes-backed-up "${bytes_backed_up}"
+        --files-backed-up 1 --bytes-backed-up "${bytes_backed_up}" \
+        --external-id "$(basename "$outfile")"
     CURRENT_RUN_ID=""
 
     log_info "Waiting ${REJOIN_WAIT}s for ${host} to fully rejoin before imaging peer ..."
@@ -459,18 +574,52 @@ cleanup_old_images() {
             continue
         fi
 
+        local -a purged_names=()
         while IFS= read -r -d '' old_file; do
             log_info "Removing old image: ${old_file}"
             rm -f "$old_file"
+            purged_names+=("$(basename "$old_file")")
             (( removed++ )) || true
         done < <(find "$dir" -maxdepth 1 -name 'sd_image_*.img.gz' \
                      -mtime "+${IMAGE_RETENTION_DAYS}" -print0 2>/dev/null)
+
+        if (( ${#purged_names[@]} > 0 )); then
+            local -a purge_args=(--target-id "${host}")
+            local name
+            for name in "${purged_names[@]}"; do
+                purge_args+=(--external-id "${name}")
+            done
+            jabs_purge "${purge_args[@]}" \
+                --message "Removed ${#purged_names[@]} image(s) older than ${IMAGE_RETENTION_DAYS} days"
+        fi
     done
 
     if (( removed > 0 )); then
         log_info "Removed ${removed} old image(s)"
     else
         "$DRY_RUN" || log_info "No old images to remove"
+    fi
+
+    # Scrub old run logs on the same schedule as the images they document.
+    if "$DRY_RUN"; then
+        local log_count
+        log_count=$(find "$LOG_DIR" -maxdepth 1 -name 'sd_image_backup_*.log' \
+            -mtime "+${IMAGE_RETENTION_DAYS}" 2>/dev/null | wc -l)
+        log_info "[DRY RUN] Would remove ${log_count} log file(s) older than ${IMAGE_RETENTION_DAYS} days from ${LOG_DIR}"
+        return 0
+    fi
+
+    local removed_logs=0
+    while IFS= read -r -d '' old_log; do
+        [[ "$old_log" == "$LOG_FILE" ]] && continue  # never delete the log of the run currently writing it
+        log_info "Removing old log: ${old_log}"
+        rm -f "$old_log"
+        (( removed_logs++ )) || true
+    done < <(find "$LOG_DIR" -maxdepth 1 -name 'sd_image_backup_*.log' \
+                 -mtime "+${IMAGE_RETENTION_DAYS}" -print0 2>/dev/null)
+
+    if (( removed_logs > 0 )); then
+        log_info "Removed ${removed_logs} old log file(s)"
     fi
 }
 
@@ -492,7 +641,7 @@ Options:
   --dry-run    Show what would be done without creating images
   --help       Show this help message
 
-Configuration is read from sd_image_backup.conf in the same directory as this script.
+Configuration is read from dns_backup.conf in the same directory as this script.
 Images are written to: ${BACKUP_BASE_DIR}/<node>/sd_image_<timestamp>.img.gz
 
 To restore a node from an image:
@@ -510,9 +659,10 @@ preflight_checks() {
     log_info "Backup base: ${BACKUP_BASE_DIR}"
 
     if jabs_enabled; then
-        command -v python3 &>/dev/null || die "JABS_SERVER_URL is set but python3 is not installed"
-        [[ -f "${JABS_CLIENT}" ]] || die "JABS_SERVER_URL is set but ${JABS_CLIENT} is missing"
-        [[ -z "${JABS_AGENT_KEY}" ]] && die "JABS_SERVER_URL is set but JABS_AGENT_KEY is empty — register this agent on the dashboard's Agents page and set its API key"
+        command -v python3 &>/dev/null || die "JABS_DASHBOARD_URL is set but python3 is not installed"
+        command -v stdbuf &>/dev/null || die "JABS_DASHBOARD_URL is set but stdbuf is not installed (required for progress reporting)"
+        [[ -f "${JABS_CLIENT}" ]] || die "JABS_DASHBOARD_URL is set but ${JABS_CLIENT} is missing"
+        [[ -z "${JABS_AGENT_KEY}" ]] && die "JABS_DASHBOARD_URL is set but JABS_AGENT_KEY is empty — register this agent on the dashboard's Agents page and set its API key"
     fi
 
     if "$DRY_RUN"; then
@@ -555,19 +705,27 @@ main() {
     fi
 
     log_info "========================================================"
-    log_info "sd_image_backup.sh started"
+    log_info "dns_backup.sh started"
     "$DRY_RUN" && log_info "(dry-run mode — no files will be written)"
     log_info "========================================================"
 
     preflight_checks
 
     # ── JABS — bare heartbeat ──────────────────────────────────────────────
-    # No event_type/backup_set_id → server just records host online + version,
+    # No event_type/target_id → server just records host online + version,
     # without touching any backup job. Sent once per run regardless of
-    # whether either node ends up imaging successfully.
-    jabs_event --message "sd_image_backup run started"
+    # whether either node ends up imaging successfully. JOB_CRON (if set)
+    # reports this script's crontab schedule for the dashboard's "Next
+    # Event" column.
+    jabs_event --message "dns_backup run started" --job-name "${JOB_NAME}" --cron-schedule "${JOB_CRON}"
 
-    if image_node "$DNS1_HOST"; then
+    # One ID shared by both DNS1/DNS2 nodes imaged in this invocation,
+    # distinct from each node's own run_id — lets the dashboard group both
+    # nodes into a single "job run" and use its earliest start, not either
+    # node's individually.
+    JOB_RUN_ID="$(generate_uuid)"
+
+    if image_node "$DNS1_HOST" "DNS1"; then
         log_info "Node ${DNS1_HOST}: image complete"
     else
         log_error "Node ${DNS1_HOST}: image FAILED"
@@ -576,7 +734,7 @@ main() {
 
     jabs_event --message "${DNS1_HOST} finished — starting ${DNS2_HOST}"
 
-    if image_node "$DNS2_HOST"; then
+    if image_node "$DNS2_HOST" "DNS2"; then
         log_info "Node ${DNS2_HOST}: image complete"
     else
         log_error "Node ${DNS2_HOST}: image FAILED"
@@ -585,7 +743,7 @@ main() {
 
     cleanup_old_images
 
-    jabs_event --message "sd_image_backup run finished (${ERRORS} failure(s))"
+    jabs_event --message "dns_backup run finished (${ERRORS} failure(s))"
 
     log_info "========================================================"
     if (( ERRORS == 0 )); then

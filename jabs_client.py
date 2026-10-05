@@ -6,8 +6,9 @@ Implements the endpoints described in the JABS project's
 AGENTS_API_GUIDE.md (repo root of the main jabs_dev project, not part of
 this standalone dns_backup_agent repo):
     POST /api/monitoring/events
+    POST /api/monitoring/target-purged
 
-This exists so sd_image_backup.sh (a bash script) can report activity to a
+This exists so dns_backup.sh (a bash script) can report activity to a
 JABS dashboard without hand-rolling JSON in bash. It's intentionally
 dependency free (stdlib only: argparse + urllib) so it runs on any box with
 python3 and nothing else installed.
@@ -26,16 +27,26 @@ obtain a key.
 Usage:
     jabs_client.py event --server-url URL --agent-key KEY \
         [--version V] [--agent-type T] [--event-type E] \
-        [--message M] [--stage S] [--run-id R] [--backup-set-id ID] \\
-        [--backup-set-name N] [--job-name J] [--backup-type T] \\
+        [--message M] [--stage S] [--run-id R] [--job-run-id ID] [--target-id ID] \\
+        [--target-label N] [--job-name J] [--backup-type T] \\
         [--source S] [--destination D] [--encrypt true|false] \\
         [--sync true|false] [--status success|failed] \\
         [--duration-seconds F] [--files-backed-up N] \\
-        [--bytes-backed-up N] [--bytes-compressed N] \\
+        [--bytes-backed-up N] [--bytes-compressed N] \
+        [--percent-complete N] [--bytes-per-second F] \
+        [--eta-seconds N] [--current-item PATH] \
         [--error-code N] [--error-message M] [--timeout SEC]
 
-Omit a --event-type and --backup-set-id on `event` to send a bare
+Omit a --event-type and --target-id on `event` to send a bare
 heartbeat (no backup job created/updated) — see AGENTS_API_GUIDE.md.
+
+    jabs_client.py purge --server-url URL --agent-key KEY \
+        --target-id ID --external-id ID1 [--external-id ID2 ...] \
+        [--message M]
+
+Call `purge` right after deleting specific rotated-out artifact(s) whose
+external_id was previously reported on an `event` call's backup_complete,
+to mark the matching run(s) as purged on the dashboard.
 
 See AGENTS_API_GUIDE.md for full field semantics and server behavior.
 """
@@ -91,14 +102,17 @@ def cmd_event(args):
         "message": args.message,
         "stage": args.stage,
         "run_id": args.run_id,
-        "backup_set_id": args.backup_set_id,
-        "backup_set_name": args.backup_set_name,
+        "job_run_id": args.job_run_id,
+        "target_id": args.target_id,
+        "target_label": args.target_label,
         "job_name": args.job_name,
         "backup_type": args.backup_type,
         "source": args.source,
         "destination": args.destination,
         "status": args.status,
+        "current_item": args.current_item,
         "error_message": args.error_message,
+        "cron_schedule": args.cron_schedule,
     }
     for key, val in optional_str.items():
         if val is not None and val != "":
@@ -116,10 +130,32 @@ def cmd_event(args):
         payload["bytes_backed_up"] = args.bytes_backed_up
     if args.bytes_compressed is not None:
         payload["bytes_compressed"] = args.bytes_compressed
+    if args.bytes_per_second is not None:
+        payload["bytes_per_second"] = args.bytes_per_second
     if args.error_code is not None:
         payload["error_code"] = args.error_code
+    if args.external_id is not None and args.external_id != "":
+        payload["external_id"] = args.external_id
 
     url = args.server_url.rstrip("/") + "/api/monitoring/events"
+    status, body = _post(url, payload, args.timeout, args.agent_key)
+    _report(status, body)
+
+
+def cmd_purge(args):
+    external_ids = [x for x in (args.external_id or []) if x]
+    if not external_ids:
+        print("jabs_client: purge requires at least one --external-id", file=sys.stderr)
+        return
+
+    payload = {
+        "target_id": args.target_id,
+        "external_ids": external_ids,
+    }
+    if args.message:
+        payload["message"] = args.message
+
+    url = args.server_url.rstrip("/") + "/api/monitoring/target-purged"
     status, body = _post(url, payload, args.timeout, args.agent_key)
     _report(status, body)
 
@@ -145,8 +181,9 @@ def build_parser():
     ev.add_argument("--message")
     ev.add_argument("--stage")
     ev.add_argument("--run-id")
-    ev.add_argument("--backup-set-id")
-    ev.add_argument("--backup-set-name")
+    ev.add_argument("--job-run-id", help="Shared ID for every target/pair in one overall script invocation")
+    ev.add_argument("--target-id")
+    ev.add_argument("--target-label")
     ev.add_argument("--job-name")
     ev.add_argument("--backup-type")
     ev.add_argument("--source")
@@ -158,9 +195,20 @@ def build_parser():
     ev.add_argument("--files-backed-up", type=int)
     ev.add_argument("--bytes-backed-up", type=int)
     ev.add_argument("--bytes-compressed", type=int)
+    ev.add_argument("--bytes-per-second", type=float)
+    ev.add_argument("--current-item")
     ev.add_argument("--error-code", type=int)
     ev.add_argument("--error-message")
+    ev.add_argument("--cron-schedule", help="Comma-separated cron expression(s) for job_name's schedule")
+    ev.add_argument("--external-id", help="Opaque ID of the artifact this run produced (e.g. image filename)")
     ev.set_defaults(func=cmd_event)
+
+    pg = sub.add_parser("purge", parents=[common], help="POST /api/monitoring/target-purged")
+    pg.add_argument("--target-id", required=True)
+    pg.add_argument("--external-id", action="append",
+                     help="external_id of a deleted artifact; repeat for multiple")
+    pg.add_argument("--message")
+    pg.set_defaults(func=cmd_purge)
 
     return parser
 
