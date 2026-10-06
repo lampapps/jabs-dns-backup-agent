@@ -32,7 +32,7 @@
 set -uo pipefail
 
 # Reported to the JABS dashboard as this agent's version. 
-readonly SCRIPT_VERSION="0.2.0" 
+readonly SCRIPT_VERSION="0.2.1" 
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION — defaults; override in dns_backup.conf or environment
@@ -97,6 +97,13 @@ JABS_AGENT_VERSION="${SCRIPT_VERSION}"
 # Seconds between progress heartbeats sent while a node's dd/gzip pipeline
 # is running (it can take a long time with no other natural checkpoint).
 : "${JABS_PROGRESS_INTERVAL:=300}"
+
+# Seconds between dd status=progress reports (local log + JABS POST) while
+# imaging. Each report forks a python3 process; too short an interval causes
+# enough concurrent fork/pipe churn alongside the ssh|gzip pipeline to
+# occasionally surface transient "write error: Resource temporarily
+# unavailable" EAGAIN errors on the script's own stdout.
+: "${JABS_DD_PROGRESS_INTERVAL:=30}"
 
 # -----------------------------------------------------------------------------
 # Derived runtime values (computed after config is sourced)
@@ -399,9 +406,10 @@ parse_dd_progress_line() {
 
 # watch_dd_progress RUN_ID JOB_NAME TARGET_ID  →  reads dd's status=progress
 # lines from stdin (after \r→\n translation), throttling both the local log
-# and the JABS progress POST to ~5s wall-clock (no percent/ETA available for
-# a raw block device copy, so there's no decile-based throttle here, unlike
-# the other agents). Best-effort: a parse miss on any line is just skipped.
+# and the JABS progress POST to ~JABS_DD_PROGRESS_INTERVAL wall-clock seconds
+# (no percent/ETA available for a raw block device copy, so there's no
+# decile-based throttle here, unlike the other agents). Best-effort: a parse
+# miss on any line is just skipped.
 watch_dd_progress() {
     local run_id="$1" job_name="$2" target_id="$3"
     local last_post=0 line parsed bytes_done bps now
@@ -410,7 +418,7 @@ watch_dd_progress() {
         bytes_done="${parsed%% *}"
         bps="${parsed##* }"
         now="$(date +%s)"
-        if (( now - last_post >= 5 )); then
+        if (( now - last_post >= JABS_DD_PROGRESS_INTERVAL )); then
             last_post=${now}
             log_info "Imaging ${target_id}: ${bytes_done} bytes copied (${bps} B/s)"
             jabs_event --event-type "heartbeat" --stage "Imaging in progress" \

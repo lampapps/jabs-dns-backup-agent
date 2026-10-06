@@ -52,6 +52,11 @@ BACKUP_BASE_DIR="/mnt/nas-unas/backups"
 # Per-request timeout (seconds) for calls to the JABS dashboard.
 #JABS_TIMEOUT=10
 
+# Seconds between dd status=progress reports (local log + JABS POST) while
+# imaging a node. Lower values give more frequent progress updates but fork
+# more python3 processes during the dd|gzip pipeline.
+#JABS_DD_PROGRESS_INTERVAL=30
+
 # SSH user on the RPi nodes
 #SSH_USER="pi"
 
