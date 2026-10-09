@@ -32,7 +32,7 @@
 set -uo pipefail
 
 # Reported to the JABS dashboard as this agent's version. 
-readonly SCRIPT_VERSION="0.2.1" 
+readonly SCRIPT_VERSION="0.2.2" 
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION — defaults; override in dns_backup.conf or environment
@@ -673,18 +673,26 @@ preflight_checks() {
         [[ -z "${JABS_AGENT_KEY}" ]] && die "JABS_DASHBOARD_URL is set but JABS_AGENT_KEY is empty — register this agent on the dashboard's Agents page and set its API key"
     fi
 
-    if "$DRY_RUN"; then
-        return 0
+    if ! "$DRY_RUN"; then
+        # NAS mount
+        mountpoint -q "$NAS_MOUNT" || die "NAS mount ${NAS_MOUNT} is not mounted — aborting"
+        [[ -w "$NAS_MOUNT" ]]      || die "NAS mount ${NAS_MOUNT} is not writable — aborting"
     fi
 
-    # NAS mount
-    mountpoint -q "$NAS_MOUNT" || die "NAS mount ${NAS_MOUNT} is not mounted — aborting"
-    [[ -w "$NAS_MOUNT" ]]      || die "NAS mount ${NAS_MOUNT} is not writable — aborting"
-
     # SSH connectivity (BatchMode=yes ensures we fail fast if keys aren't set up)
-    local host
-    for host in "$DNS1_HOST" "$DNS2_HOST"; do
+    # Checked even during --dry-run so a bad host/IP is caught up front.
+    local host node_name entry run_id
+    for entry in "${DNS1_HOST}:DNS1" "${DNS2_HOST}:DNS2"; do
+        host="${entry%:*}"
+        node_name="${entry##*:}"
         if ! _ssh "$host" true 2>/dev/null; then
+            run_id=""
+            jabs_enabled && run_id="$(generate_uuid)"
+            jabs_event --event-type "error" --stage "Error" --status "failed" \
+                --run-id "${run_id}" --job-name "${JOB_NAME}" --target-id "${node_name}" \
+                --backup-type "Image" --duration-seconds 0 \
+                --message "${node_name} preflight SSH check failed (${host})" \
+                --error-message "Cannot SSH to ${host} as ${SSH_USER} without a password prompt"
             die "Cannot SSH to ${host} as ${SSH_USER} without a password prompt.
   Set up SSH key authentication first:
     ssh-copy-id ${SSH_USER}@${host}
