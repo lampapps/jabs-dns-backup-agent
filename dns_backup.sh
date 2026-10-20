@@ -32,7 +32,7 @@
 set -uo pipefail
 
 # Reported to the JABS dashboard as this agent's version. 
-readonly SCRIPT_VERSION="0.2.2" 
+readonly SCRIPT_VERSION="0.2.3" 
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION — defaults; override in dns_backup.conf or environment
@@ -146,14 +146,36 @@ JABS_PROGRESS_PID=""
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
+# _log_write LINE [FILE]  →  writes LINE+newline to stdout, or appends to FILE
+# if given. The background progress heartbeat/watch_dd_progress loops
+# (see below) forking python3 alongside the ssh|gzip imaging pipeline can
+# transiently leave stdout non-blocking mid-write (a known bash/process-
+# substitution interaction), causing "write error: Resource temporarily
+# unavailable" (EAGAIN) instead of the normal blocking wait. A short retry
+# loop absorbs that instead of silently dropping the log line and spamming
+# bash's own write-error message.
+_log_write() {
+    local line="$1" file="${2:-}"
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if [[ -n "$file" ]]; then
+            printf '%s\n' "$line" >> "$file" 2>/dev/null && return 0
+        else
+            printf '%s\n' "$line" 2>/dev/null && return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
 log() {
     local level="$1"; shift
     local ts line
     ts=$(date '+%Y-%m-%d %H:%M:%S')
     printf -v line '[%s] [%-5s] %s' "$ts" "$level" "$*"
-    echo "$line"
+    _log_write "$line"
     if [[ -d "$(dirname "$LOG_FILE")" ]]; then
-        echo "$line" >> "$LOG_FILE"
+        _log_write "$line" "$LOG_FILE"
     fi
 }
 
