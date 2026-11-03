@@ -112,6 +112,12 @@ EOF
 | `JABS_DASHBOARD_URL` | (unset) | JABS dashboard base URL, e.g. `http://jabs-server:5001`. Set to enable reporting; leave unset/empty to disable. (`JABS_SERVER_URL` still works as a deprecated alias.) |
 | `JABS_AGENT_KEY` | (unset) | API key for this agent, generated when you register it on the dashboard's Agents page. |
 | `JABS_TIMEOUT` | `10` | Per-request timeout (seconds) for calls to the JABS dashboard. |
+| `EMAIL_SMTP_SERVER` | (unset) | SMTP server for failure alert emails. Email is disabled unless this and `EMAIL_TO_ADDRS` are set. See [Email alerts](#email-alerts-optional). |
+| `EMAIL_SMTP_PORT` | `587` | SMTP port. |
+| `EMAIL_USE_TLS` | `true` | Use STARTTLS. |
+| `EMAIL_TO_ADDRS` | (unset) | Comma-separated recipient list. |
+| `EMAIL_NOTIFY_ON_ERROR` | `true` | Email on failures. |
+| `EMAIL_NOTIFY_ON_SUCCESS` | `false` | Also email when a run completes cleanly. |
 
 The version reported to the dashboard is not a config option — it's the
 `SCRIPT_VERSION` constant at the top of `dns_backup.sh`, bumped in git each
@@ -172,6 +178,49 @@ Reporting is fire-and-forget and best-effort: it's skipped entirely during
 `--dry-run`, and any failure (server unreachable, bad response, `python3`
 missing) is logged as a `WARN` but never fails the imaging run itself. Leave
 `JABS_DASHBOARD_URL` unset/empty to disable it completely.
+
+---
+
+## Email alerts (optional)
+
+Independent of the JABS dashboard (which only sends digests), `dns_backup.sh`
+emails you immediately when a run goes wrong, via `emailer.py` (stdlib only,
+requires `python3`). An email is sent when:
+
+- a node's imaging fails (including not being able to create the output
+  directory),
+- a node's services could not be restarted after imaging — that node may be
+  left without DNS, so check it right away,
+- the run aborts in preflight (SSH unreachable, NAS not mounted/writable,
+  missing dependency, ...),
+- the script is terminated mid-run (the `EXIT` trap restarts the node's
+  services first, and the email says whether that worked),
+- optionally, when both nodes complete cleanly (`EMAIL_NOTIFY_ON_SUCCESS=true`).
+
+Settings in `dns_backup.conf` (email stays off until both server and
+recipients are set):
+
+```bash
+EMAIL_SMTP_SERVER="smtp.example.com"
+EMAIL_SMTP_PORT=587
+EMAIL_USE_TLS=true
+EMAIL_TO_ADDRS="admin@example.com,other@example.com"   # comma-separated
+EMAIL_NOTIFY_ON_ERROR=true
+EMAIL_NOTIFY_ON_SUCCESS=false
+```
+
+SMTP credentials go in `.env` (not the conf file), which `emailer.py` reads
+itself so the password never appears on a command line:
+
+```bash
+cp .env.example .env && chmod 600 .env
+# then set JABS_SMTP_USERNAME and JABS_SMTP_PASSWORD
+./dns_backup.sh --test-email      # send a test message and exit
+```
+
+During `--dry-run`, failure emails are still sent with a `[DRY RUN]` subject
+prefix so the setup can be exercised. A send failure is logged as a warning
+and never fails or aborts the imaging run.
 
 ---
 

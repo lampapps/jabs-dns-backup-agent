@@ -37,6 +37,21 @@ JOB_NAME="DNS Backup"
 # cron actually invokes it, regardless of this value.
 #JOB_CRON="0 3 1 * *"
 
+# ── Email alerts (optional, independent of the dashboard) ─────────────────
+# Sends an immediate email when a node's imaging fails, a node's services
+# can't be restarted, preflight fails, or the run is interrupted, via
+# emailer.py (stdlib-only; requires python3). Leave EMAIL_SMTP_SERVER empty
+# to disable. SMTP credentials (JABS_SMTP_USERNAME / JABS_SMTP_PASSWORD) go
+# in .env next to this script, not here — see .env.example.
+# Verify the setup with: ./dns_backup.sh --test-email
+#EMAIL_SMTP_SERVER="smtp.example.com"
+#EMAIL_SMTP_PORT=587
+#EMAIL_USE_TLS=true
+# Comma-separated recipient list
+#EMAIL_TO_ADDRS="admin@example.com"
+#EMAIL_NOTIFY_ON_ERROR=true
+#EMAIL_NOTIFY_ON_SUCCESS=false
+
 # NAS mount point (must be mounted and writable on your workstation)
 NAS_MOUNT="/mnt/nas-unas"
 

@@ -14,14 +14,15 @@
 # authentication with passwordless sudo for 'dd' and 'systemctl' on each node.
 #
 # Usage:
-#   ./dns_backup.sh [--dry-run] [--help]
+#   ./dns_backup.sh [--dry-run] [--test-email] [--help]
 #
 # Config file (sourced if present, in the same directory as this script):
 #   dns_backup.conf
 #
-#   python3      — only required if JABS_DASHBOARD_URL is set (see below).
-#                  Used to run jabs_client.py, which reports imaging activity
-#                  to a JABS dashboard's Agent Monitoring API.
+#   python3      — only required if JABS_DASHBOARD_URL or EMAIL_SMTP_SERVER is
+#                  set (see below). Used to run jabs_client.py, which reports
+#                  imaging activity to a JABS dashboard's Agent Monitoring API,
+#                  and emailer.py, which sends failure alert emails.
 #                  Debian/Ubuntu : sudo apt install python3
 #                  RHEL/Fedora   : sudo dnf install python3
 #
@@ -32,7 +33,7 @@
 set -uo pipefail
 
 # Reported to the JABS dashboard as this agent's version. 
-readonly SCRIPT_VERSION="0.2.3" 
+readonly SCRIPT_VERSION="0.3.1"
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION — defaults; override in dns_backup.conf or environment
@@ -105,6 +106,17 @@ JABS_AGENT_VERSION="${SCRIPT_VERSION}"
 # unavailable" EAGAIN errors on the script's own stdout.
 : "${JABS_DD_PROGRESS_INTERVAL:=30}"
 
+# ── Email alerts — independent of the JABS dashboard. Disabled unless both
+# EMAIL_SMTP_SERVER and EMAIL_TO_ADDRS are set; SMTP credentials live in .env
+# and are read by emailer.py itself ─────────────────────────────────────────
+EMAILER="${SCRIPT_DIR}/emailer.py"
+: "${EMAIL_SMTP_SERVER:=}"
+: "${EMAIL_SMTP_PORT:=587}"
+: "${EMAIL_USE_TLS:=true}"
+: "${EMAIL_TO_ADDRS:=}"
+: "${EMAIL_NOTIFY_ON_ERROR:=true}"
+: "${EMAIL_NOTIFY_ON_SUCCESS:=false}"
+
 # -----------------------------------------------------------------------------
 # Derived runtime values (computed after config is sourced)
 # -----------------------------------------------------------------------------
@@ -117,7 +129,15 @@ readonly LOG_DIR="${SCRIPT_DIR}/logs"
 readonly LOG_FILE="${LOG_DIR}/sd_image_backup_${TIMESTAMP}.log"
 
 DRY_RUN=false
+TEST_EMAIL=false
 ERRORS=0
+
+# Reason for the most recent failure, included in alert emails.
+LAST_ERROR=""
+
+# True once an alert already covers this exit (or none is warranted), so the
+# EXIT trap doesn't send a second, redundant one.
+_EXIT_ALERT_DONE=false
 
 # Trap state — tracks whether services on a node are currently stopped.
 # The EXIT trap uses this to restart services if the script is interrupted.
@@ -185,6 +205,8 @@ log_error() { log "ERROR" "$@"; }
 
 die() {
     log_error "$*"
+    _EXIT_ALERT_DONE=true
+    send_email_alert error "${JOB_NAME} aborted before imaging" "$*"
     exit 1
 }
 
@@ -241,27 +263,36 @@ start_services() {
     fi
 
     log_info "Starting services on ${host} (${restart_list}) ..."
-    local svc
+    local svc failed=()
     for svc in "${reversed[@]}"; do
         if _ssh "$host" "sudo systemctl start ${svc}" 2>/dev/null; then
             log_info "  Started: ${svc}"
         else
             log_warn "  Could not start ${svc} on ${host}"
+            failed+=( "$svc" )
         fi
     done
 
-    # Clear trap state — services are back up
+    # Restart has been attempted; don't let the EXIT trap retry it
     _TRAP_SERVICES_STOPPED=false
     _TRAP_NODE=""
+
+    if (( ${#failed[@]} > 0 )); then
+        _note_error "Could not restart ${failed[*]} on ${host} — it may be left without DNS services"
+        return 1
+    fi
 }
 
 # -----------------------------------------------------------------------------
 # Cleanup trap — ensures services are restarted if the script is interrupted
 # -----------------------------------------------------------------------------
 _cleanup() {
+    local rc=$?
+    local stopped_node="" restart_failed=false
     if "$_TRAP_SERVICES_STOPPED" && [[ -n "$_TRAP_NODE" ]]; then
+        stopped_node="$_TRAP_NODE"
         log_warn "Script interrupted — restarting services on ${_TRAP_NODE}"
-        start_services "$_TRAP_NODE"
+        start_services "$_TRAP_NODE" || restart_failed=true
     fi
 
     _stop_progress_heartbeat
@@ -277,8 +308,80 @@ _cleanup() {
             --error-message "${CURRENT_JOB_NAME} imaging interrupted by script termination (resumes next run)"
         CURRENT_RUN_ID=""
     fi
+
+    if ! "$_EXIT_ALERT_DONE" && ! "$DRY_RUN" && { (( rc != 0 )) || [[ -n "$stopped_node" ]]; }; then
+        local detail="dns_backup.sh terminated unexpectedly (exit code ${rc})."
+        if [[ -n "$stopped_node" ]]; then
+            detail+=" It was interrupted while imaging ${stopped_node}."
+            if "$restart_failed"; then
+                detail+=" ${LAST_ERROR}"
+            else
+                detail+=" Services on ${stopped_node} were restarted."
+            fi
+        fi
+        send_email_alert error "${JOB_NAME} terminated unexpectedly" "${detail}"
+    fi
 }
-trap _cleanup EXIT INT TERM
+# INT/TERM must exit explicitly; a bare trap handler would let the script keep running.
+trap _cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# -----------------------------------------------------------------------------
+# Email alerts
+# -----------------------------------------------------------------------------
+# Sent directly via emailer.py, independent of the JABS dashboard. A failed or
+# unconfigured send is only logged and never aborts the run.
+
+email_enabled() { [[ -n "${EMAIL_SMTP_SERVER}" && -n "${EMAIL_TO_ADDRS}" ]]; }
+
+# _note_error MESSAGE  →  appends to LAST_ERROR (reset per node in image_node)
+_note_error() {
+    LAST_ERROR="${LAST_ERROR:+${LAST_ERROR}; }$1"
+}
+
+# send_email_alert EVENT_TYPE SUBJECT DETAIL
+# EVENT_TYPE is error|success|test. Returns 0 sent, 1 failed, 2 skipped
+# (email not configured, or this event type is disabled in the conf).
+send_email_alert() {
+    local event_type="$1" subject="$2" detail="$3"
+    email_enabled || return 2
+
+    if ! command -v python3 &>/dev/null || [[ ! -f "${EMAILER}" ]]; then
+        log_warn "Email alert not sent: python3 or ${EMAILER} is missing"
+        return 1
+    fi
+
+    local tag=""
+    "$DRY_RUN" && tag="[DRY RUN] "
+
+    local body output rc=0
+    printf -v body '%s\n\nHost: %s\nJob:  %s\nTime: %s\nLog:  %s\n' \
+        "${tag}${detail}" "${HOSTNAME:-unknown}" "${JOB_NAME}" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${LOG_FILE}"
+
+    output="$(printf '%s' "${body}" | \
+        EMAIL_SMTP_SERVER="${EMAIL_SMTP_SERVER}" EMAIL_SMTP_PORT="${EMAIL_SMTP_PORT}" \
+        EMAIL_USE_TLS="${EMAIL_USE_TLS}" EMAIL_TO_ADDRS="${EMAIL_TO_ADDRS}" \
+        EMAIL_NOTIFY_ON_ERROR="${EMAIL_NOTIFY_ON_ERROR}" \
+        EMAIL_NOTIFY_ON_SUCCESS="${EMAIL_NOTIFY_ON_SUCCESS}" \
+        python3 "${EMAILER}" --subject "JABS ${tag}${subject}" \
+            --event-type "${event_type}" 2>&1)" || rc=$?
+
+    case "${rc}" in
+        0) log_info "${output}" ;;
+        2) ;;
+        *) log_warn "Email alert failed to send: ${output}"; rc=1 ;;
+    esac
+    return "${rc}"
+}
+
+# _alert_node_failure HOST NODE_NAME
+_alert_node_failure() {
+    local host="$1" node_name="$2"
+    send_email_alert error "${JOB_NAME} failed: ${node_name} (${host})" \
+        "Imaging of ${node_name} (${host}) failed: ${LAST_ERROR:-unknown error}"
+}
 
 # -----------------------------------------------------------------------------
 # JABS agent monitoring
@@ -462,6 +565,7 @@ image_node() {
     local outdir="${BACKUP_BASE_DIR}/${host}"
     local outfile="${outdir}/sd_image_${TIMESTAMP}.img.gz"
 
+    LAST_ERROR=""
     log_info "========================================"
     log_info "Imaging node: ${host}"
     log_info "  Source:      ${host}:${SD_DEVICE}"
@@ -469,7 +573,7 @@ image_node() {
     log_info "========================================"
 
     if ! "$DRY_RUN"; then
-        mkdir -p "$outdir" || { log_error "Cannot create directory: ${outdir}"; return 1; }
+        mkdir -p "$outdir" || { log_error "Cannot create directory: ${outdir}"; _note_error "Cannot create directory ${outdir}"; return 1; }
     fi
 
     # ── JABS: one run_id/job target per node per run (a new dated image) ──
@@ -542,6 +646,7 @@ image_node() {
             log_info "Image saved: $(basename "$outfile") (${size})"
         else
             log_error "dd/gzip pipeline failed for ${host}"
+            _note_error "dd/gzip pipeline failed for ${host}"
             rm -f "$tmp_file"
             imaging_failed=true
         fi
@@ -549,7 +654,8 @@ image_node() {
 
     _stop_progress_heartbeat
 
-    start_services "$host"
+    local services_failed=false
+    start_services "$host" || services_failed=true
 
     local duration=$(( $(date +%s) - image_start_epoch ))
 
@@ -574,6 +680,9 @@ image_node() {
         --files-backed-up 1 --bytes-backed-up "${bytes_backed_up}" \
         --external-id "$(basename "$outfile")"
     CURRENT_RUN_ID=""
+
+    # The image itself is fine, but the node still needs attention.
+    "$services_failed" && return 1
 
     log_info "Waiting ${REJOIN_WAIT}s for ${host} to fully rejoin before imaging peer ..."
     "$DRY_RUN" || sleep "$REJOIN_WAIT"
@@ -668,10 +777,12 @@ Run from your workstation. Requires SSH key-based auth with passwordless
 sudo for 'dd' and 'systemctl' on each node. See README for setup.
 
 Options:
-  --dry-run    Show what would be done without creating images
-  --help       Show this help message
+  --dry-run      Show what would be done without creating images
+  --test-email   Send a test alert email using the EMAIL_* settings and exit
+  --help         Show this help message
 
 Configuration is read from dns_backup.conf in the same directory as this script.
+Email alert credentials (JABS_SMTP_USERNAME/JABS_SMTP_PASSWORD) are read from .env.
 Images are written to: ${BACKUP_BASE_DIR}/<node>/sd_image_<timestamp>.img.gz
 
 To restore a node from an image:
@@ -693,6 +804,15 @@ preflight_checks() {
         command -v stdbuf &>/dev/null || die "JABS_DASHBOARD_URL is set but stdbuf is not installed (required for progress reporting)"
         [[ -f "${JABS_CLIENT}" ]] || die "JABS_DASHBOARD_URL is set but ${JABS_CLIENT} is missing"
         [[ -z "${JABS_AGENT_KEY}" ]] && die "JABS_DASHBOARD_URL is set but JABS_AGENT_KEY is empty — register this agent on the dashboard's Agents page and set its API key"
+    fi
+
+    if email_enabled; then
+        # Warn only: a broken alert setup must not block the backup itself.
+        if ! command -v python3 &>/dev/null || [[ ! -f "${EMAILER}" ]]; then
+            log_warn "Email alerts are configured but python3 or ${EMAILER} is missing — alerts will not be sent"
+        fi
+    else
+        log_warn "Email alerts are not configured (EMAIL_SMTP_SERVER/EMAIL_TO_ADDRS) — failures will not be emailed"
     fi
 
     if ! "$DRY_RUN"; then
@@ -732,10 +852,22 @@ main() {
     for arg in "$@"; do
         case "$arg" in
             --dry-run) DRY_RUN=true ;;
+            --test-email) TEST_EMAIL=true ;;
             --help|-h) usage ;;
-            *) die "Unknown argument: ${arg}. Use --help for usage." ;;
+            *)
+                log_error "Unknown argument: ${arg}. Use --help for usage."
+                _EXIT_ALERT_DONE=true  # usage error, not a backup failure
+                exit 1
+                ;;
         esac
     done
+
+    if "$TEST_EMAIL"; then
+        _EXIT_ALERT_DONE=true
+        email_enabled || { log_error "Email is not configured: set EMAIL_SMTP_SERVER and EMAIL_TO_ADDRS in dns_backup.conf"; exit 1; }
+        send_email_alert test "${JOB_NAME} test email" "This is a test alert from dns_backup.sh. Email alerts are working."
+        exit $?
+    fi
 
     # Ensure log directory exists before first log_info call
     if ! "$DRY_RUN"; then
@@ -768,6 +900,7 @@ main() {
     else
         log_error "Node ${DNS1_HOST}: image FAILED"
         (( ERRORS++ )) || true
+        _alert_node_failure "$DNS1_HOST" "DNS1"
     fi
 
     jabs_event --message "${DNS1_HOST} finished — starting ${DNS2_HOST}"
@@ -777,6 +910,7 @@ main() {
     else
         log_error "Node ${DNS2_HOST}: image FAILED"
         (( ERRORS++ )) || true
+        _alert_node_failure "$DNS2_HOST" "DNS2"
     fi
 
     cleanup_old_images
@@ -787,11 +921,14 @@ main() {
     if (( ERRORS == 0 )); then
         log_info "All SD image backups completed successfully"
         log_info "Log: ${LOG_FILE}"
+        send_email_alert success "${JOB_NAME} completed" \
+            "Both DNS nodes (${DNS1_HOST}, ${DNS2_HOST}) were imaged successfully."
     else
         log_warn "Completed with ${ERRORS} failure(s) — review log: ${LOG_FILE}"
     fi
     log_info "========================================================"
 
+    _EXIT_ALERT_DONE=true  # per-node failures were already emailed above
     (( ERRORS == 0 ))
 }
 
